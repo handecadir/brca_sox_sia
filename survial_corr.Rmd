@@ -1,0 +1,198 @@
+---
+title: "sagkalım"
+output: html_document
+date: "2025-08-09"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#library
+library(survival)
+library(survminer)
+library(pheatmap)
+```
+
+```{r}
+# Select only tumor samples for survival analysis
+# Typically, survival analysis is performed on patient (tumor) samples
+keep_samples <- metadata$sample_type %in% c("Primary Tumor")
+survival_metadata <- metadata[keep_samples, ]
+
+# Prepare survival data
+# Convert vital status to numeric: "Dead" -> 1, others -> 0
+survival_metadata$vital_status_numeric <- ifelse(survival_metadata$vital_status == "Dead", 1, 0)
+# Combine 'days_to_death' and 'days_to_last_follow_up' for overall survival time
+survival_metadata$overall_survival_time <- ifelse(
+  is.na(survival_metadata$days_to_death),
+  survival_metadata$days_to_last_follow_up,
+  survival_metadata$days_to_death
+)
+
+# Perform survival analysis for each gene
+for (gene in genes_to_label) {
+  if (gene %in% rownames(log_cpm)) {
+    # Get gene expression data
+    gene_expression_data <- log_cpm[gene, rownames(survival_metadata)]
+
+    # Split expression into "High" and "Low" based on median
+    median_expression <- median(gene_expression_data, na.rm = TRUE)
+    gene_group <- ifelse(gene_expression_data > median_expression, "High", "Low")
+    
+    # Create data frame for survival analysis
+    survival_data_df <- data.frame(
+      overall_survival_time = survival_metadata$overall_survival_time,
+      vital_status_numeric = survival_metadata$vital_status_numeric,
+      gene_group = gene_group
+    )
+    
+    # Create Survival object
+    surv_object <- Surv(time = survival_data_df$overall_survival_time, event = survival_data_df$vital_status_numeric)
+    
+    # Fit Kaplan-Meier model
+    fit <- surv_fit(surv_object ~ gene_group, data = survival_data_df)
+    
+    # Plot Kaplan-Meier curve with log-rank p-value
+    p <- ggsurvplot(
+      fit,
+      data = survival_data_df,
+      pval = TRUE,                       # Show p-value
+      conf.int = FALSE,                  # Do not show confidence interval
+      risk.table = TRUE,                 # Include risk table
+      risk.table.col = "strata",         # Color risk table by strata
+      linetype = "strata",               # Line type by strata
+      surv.median.line = "hv",           # Median survival line
+      title = paste("Survival Analysis:", gene),
+      subtitle = "High vs Low Expression Groups",
+      legend.title = "Gene Expression",
+      legend.labs = c("Low", "High")
+    )
+    
+    # Print plot
+    print(p)
+  } else {
+    # Inform if gene is not in the dataset
+    print(paste("Warning:", gene, "not found in log_cpm and skipped."))
+  }
+}
+
+```
+
+
+
+```{r}
+library(psych)
+library(pheatmap)
+
+# Separate Normal and Tumor samples
+normal_samples <- metadata$sample_type == "Solid Tissue Normal"
+tumor_samples  <- metadata$sample_type == "Primary Tumor"
+
+log_cpm_normal <- log_cpm[, normal_samples]
+log_cpm_tumor  <- log_cpm[, tumor_samples]
+
+# Select genes for correlation
+genes_to_correlate <- genes_to_label[genes_to_label %in% rownames(log_cpm)]
+
+# Function: Correlation and heatmap
+plot_correlation <- function(expression_matrix, title) {
+  expression_data_subset <- expression_matrix[genes_to_correlate, ]
+  
+  # Calculate correlations and p-values
+  correlation_test_results <- corr.test(t(expression_data_subset), use = "complete.obs", method = "pearson")
+  correlation_matrix <- correlation_test_results$r
+  p_value_matrix <- correlation_test_results$p
+  
+  # Add '*' for p < 0.05
+  correlation_text_matrix <- ifelse(p_value_matrix < 0.05, 
+                                    paste0(round(correlation_matrix, 2), "*"),
+                                    round(correlation_matrix, 2))
+  
+  # Heatmap
+  pheatmap(
+    correlation_matrix,
+    main = title,
+    display_numbers = correlation_text_matrix,
+    fontsize_row = 8,
+    fontsize_col = 8,
+    angle_col = 45,
+    color = colorRampPalette(c("blue", "white", "red"))(100)
+  )
+}
+
+# Plot for Normal and Tumor samples
+plot_correlation(log_cpm_normal, "Gene-Gene Correlation (Normal Tissue)")
+plot_correlation(log_cpm_tumor,  "Gene-Gene Correlation (Tumor Tissue)")
+
+```
+
+```{r}
+library(igraph)
+library(psych)
+
+# Separate samples
+normal_samples <- metadata$sample_type == "Solid Tissue Normal"
+tumor_samples  <- metadata$sample_type == "Primary Tumor"
+
+# Correlation and network creation function
+create_network <- function(expression_matrix, sample_type_name) {
+  genes_to_correlate <- genes_to_label[genes_to_label %in% rownames(expression_matrix)]
+  expression_data_subset <- expression_matrix[genes_to_correlate, ]
+  
+  # Compute correlation and p-values
+  correlation_test_results <- corr.test(t(expression_data_subset), use = "complete.obs", method = "pearson")
+  correlation_matrix <- correlation_test_results$r
+  p_value_matrix <- correlation_test_results$p
+  
+  # Select significant and strong correlations
+  significant_correlations <- correlation_matrix
+  significant_correlations[row(significant_correlations) == col(significant_correlations)] <- 0
+  significant_correlations[p_value_matrix >= 0.05 | abs(correlation_matrix) < 0.5] <- 0
+  
+  # Create edges
+  edges <- data.frame(
+    from = rownames(significant_correlations)[row(significant_correlations)[significant_correlations != 0]],
+    to   = colnames(significant_correlations)[col(significant_correlations)[significant_correlations != 0]],
+    value = significant_correlations[significant_correlations != 0],
+    color = ifelse(significant_correlations[significant_correlations != 0] > 0, "red", "blue")
+  )
+  
+  # Create nodes
+  nodes <- data.frame(
+    id = unique(c(as.character(edges$from), as.character(edges$to))),
+    label = unique(c(as.character(edges$from), as.character(edges$to))),
+    group = ifelse(unique(c(as.character(edges$from), as.character(edges$to))) %in% genes_to_label[1:20],
+                   "SOX Genes", "Sialyltransferase Genes")
+  )
+  
+  # Create network object
+  net <- graph_from_data_frame(d = edges, vertices = nodes, directed = FALSE)
+  V(net)$color <- ifelse(V(net)$group == "SOX Genes", "lightblue", "lightcoral")
+  V(net)$shape <- ifelse(V(net)$group == "SOX Genes", "circle", "square")
+  E(net)$color <- edges$color
+  E(net)$width <- abs(edges$value) * 5
+  
+  # Plot network
+  plot(net,
+       main = paste("Gene Interaction Network -", sample_type_name),
+       layout = layout_with_fr,
+       vertex.label.cex = 0.8,
+       vertex.label.color = "black",
+       vertex.size = 15
+  )
+  
+  legend("topleft",
+         legend = unique(V(net)$group),
+         col = unique(V(net)$color),
+         pch = unique(V(net)$shape),
+         pt.cex = 1.5,
+         cex = 0.8)
+}
+
+# Create networks for Normal and Tumor samples
+create_network(log_cpm[, normal_samples], "Normal Tissue")
+create_network(log_cpm[, tumor_samples],  "Tumor Tissue")
+
+
+```
+

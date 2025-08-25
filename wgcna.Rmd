@@ -1,0 +1,304 @@
+---
+title: "wgcna"
+output: html_document
+date: "2025-08-09"
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+dim(datExpr)
+length(net$colors)        # modül ataması yapılmış mı?
+table(net$colors)         # her renkten kaç gen var?
+
+```
+
+```{r}
+# ------------------------------
+# Gerekli paketler
+# ------------------------------
+library(WGCNA)
+library(flashClust)
+library(reshape2)
+library(impute)
+
+# Paralel çalışmayı aktif et
+enableWGCNAThreads()
+
+# ------------------------------
+# 1. Analizde kullanılacak genler
+# ------------------------------
+genes_to_label <- c(
+  "SRY", "SOX1", "SOX2", "SOX3", "SOX4", "SOX5", "SOX6", "SOX7",
+  "SOX8", "SOX9", "SOX10", "SOX11", "SOX12", "SOX13", "SOX14",
+  "SOX15", "SOX17", "SOX18", "SOX21", "SOX30",
+  "ST3GAL1", "ST3GAL2", "ST3GAL3", "ST3GAL4", "ST3GAL5", "ST3GAL6",
+  "ST6GAL1", "ST6GAL2", "ST6GALNAC1", "ST6GALNAC2", "ST6GALNAC3",
+  "ST6GALNAC4", "ST6GALNAC5", "ST6GALNAC6",
+  "ST8SIA1", "ST8SIA2", "ST8SIA3", "ST8SIA4", "ST8SIA5", "ST8SIA6"
+)
+
+# ------------------------------
+# 2. Veriyi hazırlama
+# ------------------------------
+keep_samples <- metadata$sample_type %in% c("Primary Tumor")
+genes_for_wgcna <- genes_to_label[genes_to_label %in% rownames(log_cpm)]
+datExpr <- t(log_cpm[genes_for_wgcna, keep_samples])
+
+# Klinik veriyi hazırlama
+datTraits <- data.frame(vital_status = ifelse(metadata$vital_status[keep_samples] == "Dead", 1, 0))
+rownames(datTraits) <- rownames(datExpr)
+
+# ------------------------------
+# 3. Outlier kontrolü
+# ------------------------------
+sampleTree <- hclust(dist(datExpr), method = "average")
+# Kontrol için açmak istersen: plot(sampleTree)
+
+# ------------------------------
+# 4. Soft-thresholding power seçimi ve PDF kaydı
+# ------------------------------
+powers <- c(1:10, seq(from = 12, to = 20, by = 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+
+pdf("SoftThresholdingPlot.pdf", width = 8, height = 6)
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.85, col = "red")
+dev.off()
+
+# Power seçimi
+if (is.na(sft$powerEstimate)) {
+  power <- sft$fitIndices$Power[which.max(sft$fitIndices$SFT.R.sq)]
+  cat("Otomatik seçilemedi, manuel olarak seçilen güç:", power, "\n")
+} else {
+  power <- sft$powerEstimate
+  cat("Otomatik seçilen güç:", power, "\n")
+}
+
+# ------------------------------
+# 5. Network oluşturma
+# ------------------------------
+net <- blockwiseModules(datExpr,
+                        power = power,
+                        networkType = "signed",
+                        corType = "pearson",
+                        minModuleSize = 5,
+                        reassignThreshold = 0,
+                        mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        verbose = 3)
+
+# ------------------------------
+# 6. Modül renklerini ve dendrogramı PDF’e kaydet
+# ------------------------------
+mergedColors <- labels2colors(net$colors)
+names(mergedColors) <- colnames(datExpr)
+
+pdf("DendrogramAndColors.pdf", width = 10, height = 6)
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Modül Renkleri",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+# ------------------------------
+# 7. Modül-trait korelasyonu PDF’e kaydet
+# ------------------------------
+moduleTraitCor <- cor(net$MEs, datTraits, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr))
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+
+pdf("ModuleTraitHeatmap.pdf", width = 7, height = 6)
+par(mar = c(4, 4, 2, 2))
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = names(datTraits),
+  yLabels = names(net$MEs),
+  ySymbols = names(net$MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.7,
+  zlim = c(-1, 1),
+  main = "Modül-Klinik Özellik Korelasyonu"
+)
+dev.off()
+
+# ------------------------------
+# 8. Gen ailelerini tanımla
+# ------------------------------
+gene_family <- c(
+  SRY = "SOX", SOX1 = "SOX", SOX2 = "SOX", SOX3 = "SOX", SOX4 = "SOX", SOX5 = "SOX", 
+  SOX6 = "SOX", SOX7 = "SOX", SOX8 = "SOX", SOX9 = "SOX", SOX10 = "SOX", SOX11 = "SOX", 
+  SOX12 = "SOX", SOX13 = "SOX", SOX14 = "SOX", SOX15 = "SOX", SOX17 = "SOX", SOX18 = "SOX", 
+  SOX21 = "SOX", SOX30 = "SOX",
+  ST3GAL1 = "Sialiltransferaz", ST3GAL2 = "Sialiltransferaz", ST3GAL3 = "Sialiltransferaz", ST3GAL4 = "Sialiltransferaz",
+  ST3GAL5 = "Sialiltransferaz", ST3GAL6 = "Sialiltransferaz",
+  ST6GAL1 = "Sialiltransferaz", ST6GAL2 = "Sialiltransferaz",
+  ST6GALNAC1 = "Sialiltransferaz", ST6GALNAC2 = "Sialiltransferaz", ST6GALNAC3 = "Sialiltransferaz",
+  ST6GALNAC4 = "Sialiltransferaz", ST6GALNAC5 = "Sialiltransferaz", ST6GALNAC6 = "Sialiltransferaz",
+  ST8SIA1 = "Sialiltransferaz", ST8SIA2 = "Sialiltransferaz", ST8SIA3 = "Sialiltransferaz", ST8SIA4 = "Sialiltransferaz",
+  ST8SIA5 = "Sialiltransferaz", ST8SIA6 = "Sialiltransferaz"
+)
+
+# ------------------------------
+# 9. Modüllerin içindeki genleri ve ailelerini listeleme
+# ------------------------------
+module_membership <- data.frame(Gene = names(mergedColors), Module = mergedColors)
+
+for (color in unique(mergedColors)) {
+  genes_in_module <- module_membership$Gene[module_membership$Module == color]
+  families <- gene_family[genes_in_module]
+  cat(paste("Modül:", color, " (", length(genes_in_module), " gen)\n", sep = ""))
+  cat(paste(genes_in_module, " [", families, "]", collapse = ", "), "\n\n")
+}
+
+```
+
+```{r}
+sft$fitIndices
+
+```
+
+```{r}
+# ==== Performans & sağlamlık ayarları ====
+library(WGCNA)
+allowWGCNAThreads()                     # WGCNA'yı çok çekirdekli açma
+enableWGCNAThreads(nThreads = 2)        # >>> Tek çekirdek: yavaş ama sağlam <<<
+options(stringsAsFactors = FALSE)
+
+# ==== Veri hazırlığı ====
+keep_samples <- metadata$sample_type %in% c("Primary Tumor")
+datExpr <- t(log_cpm[, keep_samples])   # TÜM genler
+datExpr <- as.data.frame(datExpr)
+
+# Temel kalite kontrol
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[, gsg$goodGenes]
+  datExpr <- datExpr[gsg$goodSamples, ]
+}
+
+# Klinik veri
+datTraits <- data.frame(
+  vital_status = ifelse(metadata$vital_status[keep_samples] == "Dead", 1, 0)
+)
+rownames(datTraits) <- rownames(datExpr)
+
+# ==== Soft-threshold seçimi (PDF) ====
+powers <- c(1:10, seq(12, 20, 2))
+sft <- pickSoftThreshold(
+  datExpr,
+  powerVector = powers,
+  networkType = "signed",
+  corFnc = "bicor",
+  corOptions = list(maxPOutliers = 0.05),   # burası list olacak
+  verbose = 5,
+  blockSize = ncol(datExpr)                 # tüm genleri tek seferde işle
+)
+
+pdf("SoftThresholdingPlot.pdf", width = 8, height = 6)
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.85, col = "red")
+dev.off()
+
+power <- if (is.na(sft$powerEstimate)) {
+  sft$fitIndices$Power[which.max(sft$fitIndices$SFT.R.sq)]
+} else sft$powerEstimate
+cat("Seçilen power:", power, "\n")
+
+# ==== Ağ ve modüller ====
+net <- blockwiseModules(
+  datExpr,
+  power = power,
+  networkType = "signed",
+  TOMType = "signed",
+  corType = "bicor",
+  maxPOutliers = 0.05,
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = TRUE,
+  saveTOMs = FALSE,
+  verbose = 3,
+  blockSize = ncol(datExpr)    # yine tüm genleri tek seferde işle
+)
+
+mergedColors <- labels2colors(net$colors)
+names(mergedColors) <- colnames(datExpr)
+
+pdf("DendrogramAndColors.pdf", width = 10, height = 6)
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  mergedColors[net$blockGenes[[1]]],
+  "Modül Renkleri",
+  dendroLabels = FALSE, hang = 0.03,
+  addGuide = TRUE, guideHang = 0.05
+)
+dev.off()
+
+# ==== Modül-trait korelasyonu ====
+MEs <- orderMEs(net$MEs)
+
+moduleTraitCor <- cor(MEs, datTraits, use = "p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(datExpr))
+
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+
+pdf("ModuleTraitHeatmap.pdf", width = 7, height = 6)
+par(mar = c(4, 5, 2, 2))
+labeledHeatmap(
+  Matrix = moduleTraitCor,
+  xLabels = names(datTraits),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.7,
+  zlim = c(-1, 1),
+  main = "Modül-Klinik Özellik Korelasyonu"
+)
+dev.off()
+
+# ==== İlgi genlerinin modülleri ====
+genes_to_label <- c(
+  "SRY","SOX1","SOX2","SOX3","SOX4","SOX5","SOX6","SOX7","SOX8","SOX9","SOX10",
+  "SOX11","SOX12","SOX13","SOX14","SOX15","SOX17","SOX18","SOX21","SOX30",
+  "ST3GAL1","ST3GAL2","ST3GAL3","ST3GAL4","ST3GAL5","ST3GAL6",
+  "ST6GAL1","ST6GAL2","ST6GALNAC1","ST6GALNAC2","ST6GALNAC3","ST6GALNAC4",
+  "ST6GALNAC5","ST6GALNAC6","ST8SIA1","ST8SIA2","ST8SIA3","ST8SIA4","ST8SIA5","ST8SIA6"
+)
+
+module_membership <- data.frame(Gene = names(mergedColors), Module = mergedColors)
+
+cat("\nBelirlediğin Genlerin Modülleri:\n")
+for (g in genes_to_label) {
+  mc <- module_membership$Module[module_membership$Gene == g]
+  if (length(mc) > 0) {
+    cat(sprintf("%s : Modül %s\n", g, mc))
+  } else {
+    cat(sprintf("%s : bu analizde modüle atanmadı / bulunamadı.\n", g))
+  }
+}
+
+```
+

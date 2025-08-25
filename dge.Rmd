@@ -1,0 +1,313 @@
+---
+title: "yuksek"
+output: html_document
+date: "2025-08-08"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#Library
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(survival)
+library(survminer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(edgeR)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(RColorBrewer)
+library(WGCNA)
+library(reshape2)
+
+```
+
+```{r}
+# The cancer type I am interested in
+cancer_type <- "TCGA-BRCA"
+# Query RNA-seq data from GDC
+query <- GDCquery(
+  project = cancer_type,
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  experimental.strategy = "RNA-Seq"
+)
+
+# Download the data
+GDCdownload(query)
+
+# Load the downloaded data into the R environment
+rnaseq_data <- GDCprepare(query)
+
+```
+
+```{r}
+counts <- assay(rnaseq_data, "unstranded")  
+metadata <- colData(rnaseq_data)
+
+# Find the column name that contains the normal and tumor labels
+head(metadata)
+# Example for tumor-normal status
+table(metadata$sample_type)
+
+```
+
+```{r}
+# Get the row names of the counts object
+ensembl_ids <- rownames(counts)
+# Remove the part after the dot to obtain clean Ensembl IDs
+clean_ensembl_ids <- sub("\\..*", "", ensembl_ids)
+# Update the row names of the counts object with the cleaned IDs
+rownames(counts) <- clean_ensembl_ids
+
+# Convert Ensembl IDs to gene symbols
+gene_symbols <- mapIds(
+  x = org.Hs.eg.db,
+  keys = rownames(counts),
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "first"
+)
+
+# For NAs (unmatched), keep the original Ensembl IDs
+final_gene_names <- ifelse(is.na(gene_symbols), rownames(counts), gene_symbols)
+# Replace the row names of the counts object with the new gene names
+rownames(counts) <- final_gene_names
+
+```
+
+
+
+```{r}
+
+# Create DGEList
+dge <- DGEList(counts = counts)
+
+# Calculate TMM normalization factors
+dge <- calcNormFactors(dge, method = "TMM") 
+
+# Calculate CPM (using TMM normalization factors)
+cpm_data <- cpm(dge, normalized.lib.sizes = TRUE)
+
+# Filter out lowly expressed genes
+# Select genes with CPM > 1 in at least 10% of samples
+# This provides stricter and data-driven filtering
+min_samples <- max(2, floor(0.1 * ncol(cpm_data)))
+keep <- rowSums(cpm_data > 1) >= min_samples
+cpm_filtered <- cpm_data[keep, ]
+print(paste("Before filtering:", nrow(cpm_data), "genes."))
+print(paste("After filtering:", nrow(cpm_filtered), "genes."))
+
+# Log2 transformation
+log_cpm <- log2(cpm_filtered + 1)
+
+# PCA analysis (taking samples as rows)
+pca <- prcomp(t(log_cpm), scale. = TRUE)
+
+# Convert PCA results to a data frame
+pca_df <- data.frame(PC1 = pca$x[,1],
+                     PC2 = pca$x[,2],
+                     sample_type = factor(metadata$sample_type,
+                                          levels = c("Solid Tissue Normal", "Primary Tumor", "Metastatic")))
+
+# Color palette
+colors <- c("Solid Tissue Normal" = "#377eb8",
+            "Primary Tumor" = "#e41a1c",
+            "Metastatic" = "#4daf4a")
+
+# Draw PCA plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = sample_type)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(title = "PCA of RNA-Seq Data (log2 CPM normalized with TMM)",
+       x = paste0("PC1 (", round(summary(pca)$importance[2,1]*100, 1), "% variance)"),
+       y = paste0("PC2 (", round(summary(pca)$importance[2,2]*100, 1), "% variance)"),
+       color = "Sample Type") +
+  scale_color_manual(values = colors)
+
+
+```
+
+```{r}
+
+# Select Normal and Tumor samples for analysis
+# Exclude Metastatic samples for now
+keep_samples <- metadata$sample_type %in% c("Solid Tissue Normal", "Primary Tumor")
+dge_subset <- dge[, keep_samples]
+metadata_subset <- metadata[keep_samples, ]
+
+# Create the design matrix for comparison
+# This is needed to compare "Normal" and "Tumor" groups
+design <- model.matrix(~0 + factor(metadata_subset$sample_type, levels = c("Solid Tissue Normal", "Primary Tumor")))
+colnames(design) <- c("Normal", "Tumor")
+
+# Estimate dispersion
+dge_subset <- estimateDisp(dge_subset, design, robust = TRUE)
+
+# Fit the Generalized Linear Model (GLM)
+fit <- glmFit(dge_subset, design)
+
+# Compare Normal and Tumor groups with Likelihood Ratio Test (LRT)
+contrast.matrix <- makeContrasts(Tumor_vs_Normal = Tumor - Normal, levels = design)
+lrt <- glmLRT(fit, contrast = contrast.matrix)
+
+# Extract analysis results into a data frame
+dge_results <- topTags(lrt, n = Inf, sort.by = "PValue")$table
+
+# Prepare results for visualization
+# Calculate -log10(FDR)
+dge_results$logFDR <- -log10(dge_results$FDR)
+# Create a new column to label significant genes
+dge_results$label <- "Not Significant"
+dge_results$label[dge_results$FDR < 0.05 & dge_results$logFC > 1] <- "Upregulated"
+dge_results$label[dge_results$FDR < 0.05 & dge_results$logFC < -1] <- "Downregulated"
+
+# Draw the Volcano Plot 🌋
+ggplot(dge_results, aes(x = logFC, y = logFDR, color = label)) +
+  geom_point(alpha = 0.6, size = 2) +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("Downregulated" = "#377eb8", "Upregulated" = "#e41a1c", "Not Significant" = "gray")) +
+  labs(
+    title = "DGE Analysis of Normal vs Tumor Tissues",
+    subtitle = "Volcano Plot (FDR < 0.05, |logFC| > 1)",
+    x = "log2(Fold Change)",
+    y = "-log10(FDR)",
+    color = "Gene Status"
+  ) +
+  # Add significance threshold lines
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", size = 0.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", size = 0.5) +
+  # Label the most significant genes (optional)
+  geom_text_repel(
+    data = subset(dge_results, label != "Not Significant"),
+    aes(label = rownames(subset(dge_results, label != "Not Significant"))),
+    box.padding = 0.5,
+    point.padding = 0.5,
+    segment.color = 'grey50'
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+# List of genes you want to label and highlight
+genes_to_label <- c("SRY", "SOX1", "SOX2", "SOX3", "SOX4", "SOX5", "SOX6", "SOX7",
+    "SOX8", "SOX9", "SOX10", "SOX11", "SOX12", "SOX13", "SOX14",
+    "SOX15", "SOX17", "SOX18", "SOX21", "SOX30","ST3GAL1", "ST3GAL2", "ST3GAL3", "ST3GAL4", "ST3GAL5", "ST3GAL6","ST6GAL1", "ST6GAL2", "ST6GALNAC1", "ST6GALNAC2", "ST6GALNAC3",
+    "ST6GALNAC4", "ST6GALNAC5", "ST6GALNAC6", "ST8SIA1", "ST8SIA2",
+    "ST8SIA3", "ST8SIA4", "ST8SIA5", "ST8SIA6")
+
+# Prepare results for visualization
+dge_results$logFDR <- -log10(dge_results$FDR)
+dge_results$label <- "Not Significant"
+dge_results$label[dge_results$FDR < 0.05 & dge_results$logFC > 1] <- "Upregulated"
+dge_results$label[dge_results$FDR < 0.05 & dge_results$logFC < -1] <- "Downregulated"
+
+# Add a column to mark only the selected genes
+dge_results$highlight <- ifelse(rownames(dge_results) %in% genes_to_label, "Important Gene", "Other Gene")
+
+# Draw the Volcano Plot 🌋
+ggplot(dge_results, aes(x = logFC, y = logFDR, color = label)) +
+  # Plot all genes
+  geom_point(data = subset(dge_results, highlight == "Other Gene"), alpha = 0.6, size = 2) +
+  # Highlight only the important genes with larger points in gold
+  geom_point(data = subset(dge_results, highlight == "Important Gene"), size = 4, shape = 21, fill = "gold", color = "black") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("Downregulated" = "#377eb8", "Upregulated" = "#e41a1c", "Not Significant" = "gray")) +
+  labs(
+    title = "DGE Analysis of Normal vs Tumor Tissues",
+    subtitle = "Volcano Plot (FDR < 0.05, |logFC| > 1)",
+    x = "log2(Fold Change)",
+    y = "-log10(FDR)",
+    color = "Gene Status"
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", linewidth = 0.5) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black", linewidth = 0.5) +
+  # Label only the selected genes
+  geom_text_repel(
+    data = subset(dge_results, rownames(dge_results) %in% genes_to_label),
+    aes(label = rownames(subset(dge_results, rownames(dge_results) %in% genes_to_label))),
+    box.padding = 0.5,
+    point.padding = 0.5,
+    segment.color = 'grey50',
+    max.overlaps = Inf
+  ) +
+  theme(legend.position = "bottom")
+
+
+```
+
+```{r}
+# Save the entire dge_results table to an Excel file
+# Add gene names (rownames) as a column named 'Gene'
+dge_results_export <- data.frame(Gene = rownames(dge_results), dge_results)
+
+write_xlsx(
+  x = dge_results_export,
+  path = "all_genes_dge_results.xlsx"
+)
+
+# Create a table containing only the selected genes
+target_results <- dge_results[rownames(dge_results) %in% genes_to_label, ]
+
+# Save the selected genes' results to a separate Excel file
+# Add gene names (rownames) as a column named 'Gene'
+target_results_export <- data.frame(Gene = rownames(target_results), target_results)
+
+write_xlsx(
+  x = target_results_export,
+  path = "selected_genes_dge_results.xlsx"
+)
+
+# Notify that the process is complete
+print("DGE results of all genes have been saved to 'all_genes_dge_results.xlsx'.")
+print("DGE results of the selected genes have been saved to 'selected_genes_dge_results.xlsx'.")
+
+
+```
+
+```{r}
+
+# Select only the genes of interest
+genes_of_interest <- genes_to_label
+expr_subset <- log_cpm[rownames(log_cpm) %in% genes_of_interest, ]
+
+# Convert data to long format (for easier plotting with ggplot)
+expr_long <- melt(expr_subset)
+colnames(expr_long) <- c("Gene", "Sample", "Expression")
+
+# Add sample_type information from metadata
+expr_long$Sample_Type <- metadata$sample_type[match(expr_long$Sample, rownames(metadata))]
+
+# Remove metastatic samples, keep only Normal and Tumor
+expr_long <- expr_long[expr_long$Sample_Type %in% c("Solid Tissue Normal", "Primary Tumor"), ]
+expr_long$Sample_Type <- factor(expr_long$Sample_Type, levels = c("Solid Tissue Normal", "Primary Tumor"))
+
+# Draw boxplot
+ggplot(expr_long, aes(x = Sample_Type, y = Expression, fill = Sample_Type)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, size = 1, alpha = 0.5) + # Show each sample as a dot
+  facet_wrap(~Gene, scales = "free_y") + # Separate panel for each gene
+  scale_fill_manual(values = c("Solid Tissue Normal" = "#377eb8", "Primary Tumor" = "#e41a1c")) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Gene Expression in Normal and Tumor Tissues",
+    x = "",
+    y = "log2(CPM + 1)",
+    fill = "Sample Type"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+
+```
+
